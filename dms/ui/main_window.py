@@ -42,8 +42,6 @@ from dms.processing import (
     compute_rms_average,
     downsample_to_log_points,
     generate_log_sweep,
-    normalize_at_1khz,
-    smooth_fractional_octave,
 )
 from dms.session import SessionData
 from dms.settings_manager import SettingsManager
@@ -62,7 +60,6 @@ class AppState:
 
 _MEASUREMENT_F_MIN = 20.0
 _MEASUREMENT_F_MAX = 20000.0
-_DISPLAY_AVG_SMOOTHING = 48
 _DISPLAY_AVG_POINTS = 1200
 _METER_UPDATE_MS = 220
 
@@ -797,19 +794,13 @@ class MainWindow(QMainWindow):
                 f_high=_MEASUREMENT_F_MAX,
             )
 
-            mag_db = self._normalize_with_skip_noise(freqs, mag_db)
-
             freqs_ds, mag_ds = downsample_to_log_points(
                 freqs,
                 mag_db,
                 n_points=300,
                 f_ref=1000.0,
+                normalize_ref=False,
             )
-
-            idx_1k = int(np.argmin(np.abs(freqs_ds - 1000.0)))
-            if abs(freqs_ds[idx_1k] - 1000.0) > 1e-9:
-                freqs_ds[idx_1k] = 1000.0
-            mag_ds -= mag_ds[idx_1k]
 
             self._pending_curve = (freqs_ds, mag_ds)
             self._state = AppState.PASS_FAIL
@@ -905,29 +896,6 @@ class MainWindow(QMainWindow):
             f"Kept: {self._queue_index} / {target}"
         )
 
-    def _normalize_with_skip_noise(
-        self,
-        freqs: np.ndarray,
-        mag_db: np.ndarray,
-        f_ref: float = 1000.0,
-    ) -> np.ndarray:
-        """
-        Simple skip-noise normalization:
-        - estimate a local median around 1 kHz
-        - fall back to exact interpolation if needed
-        - anchor final curve to 1 kHz = 0 dB
-        """
-        if len(freqs) == 0:
-            return mag_db
-
-        band = (freqs >= 900.0) & (freqs <= 1100.0)
-        if np.count_nonzero(band) >= 3:
-            ref_val = float(np.median(mag_db[band]))
-            out = mag_db - ref_val
-            return normalize_at_1khz(freqs, out, f_ref=f_ref)
-
-        return normalize_at_1khz(freqs, mag_db, f_ref=f_ref)
-
     def _show_pass_fail_dialog(self) -> None:
         if self._state != AppState.PASS_FAIL or self._pending_curve is None:
             return
@@ -958,6 +926,7 @@ class MainWindow(QMainWindow):
             f_ref=1000.0,
             f_min=_MEASUREMENT_F_MIN,
             f_max=_MEASUREMENT_F_MAX,
+            normalize_ref=False,
         )
         self._average = (freqs, mag_db)
 
@@ -974,29 +943,12 @@ class MainWindow(QMainWindow):
                 mag_db,
                 invert=self._hrtf_invert_cb.isChecked(),
             )
-            idx_1k = int(np.argmin(np.abs(freqs - 1000.0)))
-            corrected = corrected - corrected[idx_1k]
             return freqs, corrected
 
         return freqs, mag_db
 
-    def _bottom_curve_for_display(self) -> Optional[tuple[np.ndarray, np.ndarray]]:
-        curve = self._bottom_curve_for_display_and_export()
-        if curve is None:
-            return None
-
-        freqs, mag_db = curve
-        smoothed_freqs, smoothed_mag = smooth_fractional_octave(
-            freqs,
-            mag_db,
-            fraction=_DISPLAY_AVG_SMOOTHING,
-        )
-        idx_1k = int(np.argmin(np.abs(smoothed_freqs - 1000.0)))
-        smoothed_mag = smoothed_mag - smoothed_mag[idx_1k]
-        return smoothed_freqs, smoothed_mag
-
     def _update_plots(self, *_args, show_pending: bool = False) -> None:
-        avg = self._bottom_curve_for_display()
+        avg = self._bottom_curve_for_display_and_export()
 
         kept = list(self._kept_curves)
         if show_pending and self._pending_curve is not None:

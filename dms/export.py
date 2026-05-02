@@ -49,8 +49,8 @@ def export_curve(
         lines.append(f"* HRTF Sign: {'Inverted (+)' if hrtf_invert else 'Normal (-)'}")
 
     lines += [
-        "* Normalization: 1 kHz = 0 dB",
-        "* Points: ~300 log-spaced",
+        "* Normalization: None (raw mic response)",
+        "* Points: log-spaced",
         "*",
         "* Frequency(Hz)\tMagnitude(dB)",
     ]

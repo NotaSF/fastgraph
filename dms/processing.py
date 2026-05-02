@@ -68,27 +68,27 @@ def compute_frequency_response(
     f_high: float = 20000.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Compute magnitude frequency response via spectral deconvolution.
+    Compute magnitude frequency response from the recorded sweep and the
+    known excitation sweep using regularized spectral division.
+
+    This keeps the displayed curve raw while avoiding the alignment/windowing
+    errors that can come from taking an FFT of a loosely sliced deconvolved IR.
     Returns (freqs_hz, magnitude_db) — full resolution.
     """
-    inv = generate_inverse_filter(sweep, fs, f_low, f_high)
+    sweep64 = sweep.astype(np.float64)
+    rec64 = recording.astype(np.float64)
 
-    # Use a power-of-2 FFT size covering both signals
-    total_len = len(recording) + len(inv) - 1
-    nfft = int(2 ** np.ceil(np.log2(total_len)))
+    nfft = int(2 ** np.ceil(np.log2(max(len(sweep64), len(rec64)))))
 
-    REC = np.fft.rfft(recording.astype(np.float64), n=nfft)
-    INV = np.fft.rfft(inv.astype(np.float64), n=nfft)
+    SWEEP = np.fft.rfft(sweep64, n=nfft)
+    REC = np.fft.rfft(rec64, n=nfft)
 
-    # Convolve recording with inverse filter → impulse response
-    H = REC * INV
-    h = np.fft.irfft(H)
-
-    # The valid impulse response starts at 0
-    # Take FFT of IR to get complex FR
-    nfft2 = int(2 ** np.ceil(np.log2(len(sweep))))
-    H_fr = np.fft.rfft(h[: len(sweep)], n=nfft2)
-    freqs = np.fft.rfftfreq(nfft2, d=1.0 / fs)
+    # Estimate the transfer function directly:
+    # H = Y * conj(X) / (|X|^2 + eps)
+    sweep_power = np.abs(SWEEP) ** 2
+    eps = max(float(np.max(sweep_power)) * 1e-12, 1e-18)
+    H_fr = REC * np.conj(SWEEP) / (sweep_power + eps)
+    freqs = np.fft.rfftfreq(nfft, d=1.0 / fs)
 
     mag = np.abs(H_fr)
     # Avoid log(0)
@@ -129,11 +129,12 @@ def downsample_to_log_points(
     mag_db: np.ndarray,
     n_points: int = 300,
     f_ref: float = 1000.0,
+    normalize_ref: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Resample to ~n_points log-spaced frequencies.
     Guarantees f_ref (1 kHz) is one of the output points.
-    After downsampling, re-normalizes so f_ref = 0 dB exactly.
+    Optionally re-normalizes so f_ref = 0 dB exactly.
     """
     f_min = freqs[0]
     f_max = freqs[-1]
@@ -150,9 +151,9 @@ def downsample_to_log_points(
                       fill_value=(mag_db[0], mag_db[-1]))
     out_mag = interp(target)
 
-    # Re-normalize so 1 kHz is exactly 0.000 dB
-    idx_ref_out = int(np.argmin(np.abs(target - f_ref)))
-    out_mag -= out_mag[idx_ref_out]
+    if normalize_ref:
+        idx_ref_out = int(np.argmin(np.abs(target - f_ref)))
+        out_mag -= out_mag[idx_ref_out]
 
     return target, out_mag
 
@@ -167,10 +168,10 @@ def compute_rms_average(
     f_ref: float = 1000.0,
     f_min: float = 20.0,
     f_max: float = 20000.0,
+    normalize_ref: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Average all kept curves in linear amplitude, then convert back to dB.
-    All curves must already be normalized (1 kHz = 0 dB, ~300 points).
     Uses linear interpolation to a common grid.
     """
     if not curves:
@@ -193,8 +194,8 @@ def compute_rms_average(
     avg_lin = sum_lin / count
     avg_db = 10.0 * np.log10(np.clip(avg_lin, 1e-30, None))
 
-    # Re-normalize to 1 kHz = 0 dB
-    avg_db -= avg_db[idx_ref]
+    if normalize_ref:
+        avg_db -= avg_db[idx_ref]
 
     return common_freqs, avg_db
 

@@ -67,7 +67,7 @@ class DualPlotWidget(QWidget):
         layout.setSpacing(4)
 
         self._top_plot = _make_plot_widget("Measurements")
-        self._bot_plot = _make_plot_widget("RMS Average (1/48 Oct)")
+        self._bot_plot = _make_plot_widget("RMS Average")
 
         layout.addWidget(self._top_plot, 1)
         layout.addWidget(self._bot_plot, 1)
