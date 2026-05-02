@@ -5,7 +5,6 @@ normalization, and downsampling.
 
 import numpy as np
 from scipy.interpolate import interp1d
-from scipy.signal import windows
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +163,7 @@ def downsample_to_log_points(
 
 def compute_rms_average(
     curves: list[tuple[np.ndarray, np.ndarray]],
-    n_points: int = 300,
+    n_points: int = 1200,
     f_ref: float = 1000.0,
     f_min: float = 20.0,
     f_max: float = 20000.0,
@@ -198,3 +197,38 @@ def compute_rms_average(
     avg_db -= avg_db[idx_ref]
 
     return common_freqs, avg_db
+
+
+def smooth_fractional_octave(
+    freqs: np.ndarray,
+    mag_db: np.ndarray,
+    fraction: int = 48,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Apply Gaussian smoothing on a log-frequency axis.
+
+    The smoothing bandwidth is specified in fractional octaves using
+    the full-width at half maximum of the Gaussian window.
+    """
+    if len(freqs) < 3 or len(freqs) != len(mag_db) or fraction <= 0:
+        return freqs, mag_db
+
+    log_freqs = np.log2(freqs)
+    step = float(np.median(np.diff(log_freqs)))
+    if not np.isfinite(step) or step <= 0.0:
+        return freqs, mag_db
+
+    fwhm_oct = 1.0 / float(fraction)
+    sigma_oct = fwhm_oct / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+    sigma_idx = sigma_oct / step
+    if not np.isfinite(sigma_idx) or sigma_idx <= 0.0:
+        return freqs, mag_db
+
+    radius = max(2, int(np.ceil(sigma_idx * 4.0)))
+    offsets = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel = np.exp(-0.5 * (offsets / sigma_idx) ** 2)
+    kernel /= np.sum(kernel)
+
+    padded = np.pad(mag_db.astype(np.float64), (radius, radius), mode="edge")
+    smoothed = np.convolve(padded, kernel, mode="valid")
+    return freqs, smoothed.astype(np.float64)

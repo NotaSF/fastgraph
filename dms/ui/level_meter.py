@@ -15,7 +15,7 @@ class LevelMeterWidget(QWidget):
     _CLIP = 0.0
     _YELLOW_DB = -12.0
     _RED_DB = -3.0
-    _PEAK_HOLD_FRAMES = 30
+    _PEAK_HOLD_FRAMES = 8
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -23,7 +23,7 @@ class LevelMeterWidget(QWidget):
         self._peak_db: float = self._FLOOR
         self._peak_hold_count: int = 0
         self.setMinimumSize(24, 120)
-        self.setMaximumWidth(36)
+        self.setMaximumWidth(30)
 
     @pyqtSlot(float)
     def set_level(self, db: float) -> None:

@@ -43,6 +43,7 @@ from dms.processing import (
     downsample_to_log_points,
     generate_log_sweep,
     normalize_at_1khz,
+    smooth_fractional_octave,
 )
 from dms.session import SessionData
 from dms.settings_manager import SettingsManager
@@ -57,6 +58,13 @@ class AppState:
     SWEEPING = "sweeping"
     PASS_FAIL = "pass_fail"
     QUEUE_RUNNING = "queue_running"
+
+
+_MEASUREMENT_F_MIN = 20.0
+_MEASUREMENT_F_MAX = 20000.0
+_DISPLAY_AVG_SMOOTHING = 48
+_DISPLAY_AVG_POINTS = 1200
+_METER_UPDATE_MS = 220
 
 
 class _SweepThread(QThread):
@@ -124,6 +132,66 @@ class TestLevelDialog(QDialog):
             self._spl_label.setText(f"{spl:.1f} dB SPL")
 
 
+class PassFailDialog(QDialog):
+    KEEP = "keep"
+    FAIL = "fail"
+    CANCEL = "cancel"
+
+    def __init__(self, index: int, total: int, parent=None) -> None:
+        super().__init__(parent)
+        self._choice = self.CANCEL
+        self.setModal(True)
+        self.setWindowTitle("Review Measurement")
+        self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+        self.setMinimumWidth(360)
+
+        layout = QVBoxLayout(self)
+
+        summary = QLabel(
+            f"Review measurement {index} of {total} and choose whether to keep it."
+        )
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        detail = QLabel(
+            "The latest sweep is shown in teal in the top plot while you decide."
+        )
+        detail.setWordWrap(True)
+        detail.setStyleSheet("color: #888;")
+        layout.addWidget(detail)
+
+        button_row = QHBoxLayout()
+
+        keep_btn = QPushButton("Keep")
+        keep_btn.clicked.connect(self._accept_keep)
+        button_row.addWidget(keep_btn)
+
+        fail_btn = QPushButton("Fail / Redo")
+        fail_btn.clicked.connect(self._accept_fail)
+        button_row.addWidget(fail_btn)
+
+        cancel_btn = QPushButton("Cancel Queue")
+        cancel_btn.clicked.connect(self._accept_cancel)
+        button_row.addWidget(cancel_btn)
+
+        layout.addLayout(button_row)
+
+    def choice(self) -> str:
+        return self._choice
+
+    def _accept_keep(self) -> None:
+        self._choice = self.KEEP
+        self.accept()
+
+    def _accept_fail(self) -> None:
+        self._choice = self.FAIL
+        self.accept()
+
+    def _accept_cancel(self) -> None:
+        self._choice = self.CANCEL
+        self.accept()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, session: SessionData, settings: SettingsManager) -> None:
         super().__init__()
@@ -146,6 +214,7 @@ class MainWindow(QMainWindow):
         self._active_sweep_worker: Optional[SweepWorker] = None
 
         self._last_level_dbfs = -120.0
+        self._displayed_level_dbfs = -60.0
         self._last_input_devices: list[str] = []
         self._last_output_devices: list[str] = []
 
@@ -164,6 +233,10 @@ class MainWindow(QMainWindow):
         self._start_level_monitor()
         self._apply_state_ui()
 
+        self._meter_ui_timer = QTimer(self)
+        self._meter_ui_timer.timeout.connect(self._refresh_level_meter_display)
+        self._meter_ui_timer.start(_METER_UPDATE_MS)
+
         self._device_check_timer = QTimer(self)
         self._device_check_timer.timeout.connect(self._check_devices)
         self._device_check_timer.start(1500)
@@ -172,25 +245,31 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
 
-        root = QHBoxLayout(central)
+        root = QVBoxLayout(central)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(8)
 
-        left = self._build_left_panel()
-        root.addWidget(left, 0)
+        top_bar = self._build_top_bar()
+        root.addWidget(top_bar, 0)
 
+        content = QHBoxLayout()
+        content.setSpacing(8)
         self._plots = DualPlotWidget()
-        root.addWidget(self._plots, 1)
+        content.addWidget(self._plots, 1)
+
+        right = self._build_right_panel()
+        content.addWidget(right, 0)
+        root.addLayout(content, 1)
 
         self._statusbar = QStatusBar()
         self.setStatusBar(self._statusbar)
         self._statusbar.showMessage("Ready.")
 
-    def _build_left_panel(self) -> QWidget:
+    def _build_top_bar(self) -> QWidget:
         panel = QWidget()
-        panel.setFixedWidth(300)
-        layout = QVBoxLayout(panel)
-        layout.setSpacing(10)
+        layout = QHBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
 
         session_box = QGroupBox("Session")
         sb_layout = QVBoxLayout(session_box)
@@ -229,16 +308,79 @@ class MainWindow(QMainWindow):
         layout.addWidget(dev_box)
 
         meter_box = QGroupBox("Input Level")
-        meter_layout = QHBoxLayout(meter_box)
+        meter_layout = QVBoxLayout(meter_box)
         self._level_meter = LevelMeterWidget()
-        self._level_dbfs_label = QLabel("—")
-        self._level_dbfs_label.setAlignment(
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
-        )
-        self._level_dbfs_label.setWordWrap(True)
-        meter_layout.addWidget(self._level_meter)
-        meter_layout.addWidget(self._level_dbfs_label, 1)
+        self._level_status_label = QLabel("Live RMS monitor")
+        self._level_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        meter_layout.addWidget(self._level_meter, 0, Qt.AlignmentFlag.AlignCenter)
+        meter_layout.addWidget(self._level_status_label)
         layout.addWidget(meter_box)
+
+        hrtf_box = QGroupBox("HRTF Compensation")
+        hrtf_layout = QVBoxLayout(hrtf_box)
+
+        self._hrtf_mode_combo = QComboBox()
+        self._hrtf_mode_combo.addItem("Off", "off")
+        self._hrtf_mode_combo.addItem("Apply loaded HRTF", "apply")
+        self._hrtf_mode_combo.currentIndexChanged.connect(self._update_plots)
+        hrtf_layout.addWidget(self._hrtf_mode_combo)
+
+        hrtf_btn_row = QHBoxLayout()
+        self._hrtf_load_btn = QPushButton("Load HRTF…")
+        self._hrtf_load_btn.clicked.connect(self._load_hrtf)
+        hrtf_btn_row.addWidget(self._hrtf_load_btn)
+
+        self._hrtf_clear_btn = QPushButton("Clear")
+        self._hrtf_clear_btn.clicked.connect(self._clear_hrtf)
+        hrtf_btn_row.addWidget(self._hrtf_clear_btn)
+        hrtf_layout.addLayout(hrtf_btn_row)
+
+        self._hrtf_label = QLabel("No HRTF loaded")
+        self._hrtf_label.setWordWrap(True)
+        hrtf_layout.addWidget(self._hrtf_label)
+
+        self._hrtf_invert_cb = QCheckBox("Invert sign (add instead of subtract)")
+        self._hrtf_invert_cb.stateChanged.connect(self._on_hrtf_invert_changed)
+        hrtf_layout.addWidget(self._hrtf_invert_cb)
+
+        layout.addWidget(hrtf_box, 1)
+
+        misc_box = QGroupBox("Tools")
+        misc_layout = QVBoxLayout(misc_box)
+
+        clear_btn = QPushButton("Clear All Measurements")
+        clear_btn.clicked.connect(self._clear_all)
+        misc_layout.addWidget(clear_btn)
+        self._clear_btn = clear_btn
+
+        settings_btn = QPushButton("Settings…")
+        settings_btn.clicked.connect(self._open_settings)
+        misc_layout.addWidget(settings_btn)
+        self._settings_btn = settings_btn
+
+        cal_btn = QPushButton("SPL Calibration…")
+        cal_btn.clicked.connect(self._open_calibration)
+        misc_layout.addWidget(cal_btn)
+        self._cal_btn = cal_btn
+
+        test_level_btn = QPushButton("Test Level…")
+        test_level_btn.clicked.connect(self._open_test_level)
+        misc_layout.addWidget(test_level_btn)
+        self._test_level_btn = test_level_btn
+
+        export_btn = QPushButton("Export Average…")
+        export_btn.clicked.connect(self._export)
+        misc_layout.addWidget(export_btn)
+        self._export_btn = export_btn
+
+        layout.addWidget(misc_box)
+        return panel
+
+    def _build_right_panel(self) -> QWidget:
+        panel = QWidget()
+        panel.setFixedWidth(280)
+        layout = QVBoxLayout(panel)
+        layout.setSpacing(10)
 
         queue_box = QGroupBox("Queue")
         queue_layout = QVBoxLayout(queue_box)
@@ -271,83 +413,19 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self._cancel_queue_btn)
         queue_layout.addLayout(btn_row)
 
-        pf_row = QHBoxLayout()
-        self._keep_btn = QPushButton("Keep")
-        self._keep_btn.setObjectName("btn_keep")
-        self._keep_btn.clicked.connect(self._on_keep)
-        pf_row.addWidget(self._keep_btn)
-
-        self._fail_btn = QPushButton("Fail / Redo")
-        self._fail_btn.setObjectName("btn_fail")
-        self._fail_btn.clicked.connect(self._on_fail)
-        pf_row.addWidget(self._fail_btn)
-        queue_layout.addLayout(pf_row)
-
         self._sweep_progress = QProgressBar()
         self._sweep_progress.setRange(0, 100)
         self._sweep_progress.setValue(0)
         queue_layout.addWidget(self._sweep_progress)
 
+        self._queue_hint_label = QLabel(
+            "After each sweep, pass/fail opens in a review popup."
+        )
+        self._queue_hint_label.setWordWrap(True)
+        self._queue_hint_label.setStyleSheet("color: #888;")
+        queue_layout.addWidget(self._queue_hint_label)
+
         layout.addWidget(queue_box)
-
-        hrtf_box = QGroupBox("HRTF Compensation")
-        hrtf_layout = QVBoxLayout(hrtf_box)
-
-        self._hrtf_mode_combo = QComboBox()
-        self._hrtf_mode_combo.addItem("Off", "off")
-        self._hrtf_mode_combo.addItem("Apply loaded HRTF", "apply")
-        self._hrtf_mode_combo.currentIndexChanged.connect(self._update_plots)
-        hrtf_layout.addWidget(self._hrtf_mode_combo)
-
-        hrtf_btn_row = QHBoxLayout()
-        self._hrtf_load_btn = QPushButton("Load HRTF…")
-        self._hrtf_load_btn.clicked.connect(self._load_hrtf)
-        hrtf_btn_row.addWidget(self._hrtf_load_btn)
-
-        self._hrtf_clear_btn = QPushButton("Clear")
-        self._hrtf_clear_btn.clicked.connect(self._clear_hrtf)
-        hrtf_btn_row.addWidget(self._hrtf_clear_btn)
-        hrtf_layout.addLayout(hrtf_btn_row)
-
-        self._hrtf_label = QLabel("No HRTF loaded")
-        self._hrtf_label.setWordWrap(True)
-        hrtf_layout.addWidget(self._hrtf_label)
-
-        self._hrtf_invert_cb = QCheckBox("Invert sign (add instead of subtract)")
-        self._hrtf_invert_cb.stateChanged.connect(self._on_hrtf_invert_changed)
-        hrtf_layout.addWidget(self._hrtf_invert_cb)
-
-        layout.addWidget(hrtf_box)
-
-        misc_box = QGroupBox("Tools")
-        misc_layout = QVBoxLayout(misc_box)
-
-        clear_btn = QPushButton("Clear All Measurements")
-        clear_btn.clicked.connect(self._clear_all)
-        misc_layout.addWidget(clear_btn)
-        self._clear_btn = clear_btn
-
-        settings_btn = QPushButton("Settings…")
-        settings_btn.clicked.connect(self._open_settings)
-        misc_layout.addWidget(settings_btn)
-        self._settings_btn = settings_btn
-
-        cal_btn = QPushButton("SPL Calibration…")
-        cal_btn.clicked.connect(self._open_calibration)
-        misc_layout.addWidget(cal_btn)
-        self._cal_btn = cal_btn
-
-        test_level_btn = QPushButton("Test Level…")
-        test_level_btn.clicked.connect(self._open_test_level)
-        misc_layout.addWidget(test_level_btn)
-        self._test_level_btn = test_level_btn
-
-        export_btn = QPushButton("Export Average…")
-        export_btn.clicked.connect(self._export)
-        misc_layout.addWidget(export_btn)
-        self._export_btn = export_btn
-
-        layout.addWidget(misc_box)
         layout.addStretch(1)
         return panel
 
@@ -533,7 +611,9 @@ class MainWindow(QMainWindow):
 
         input_device = self._current_input_device()
         if not input_device:
-            self._level_dbfs_label.setText("No input device selected")
+            self._displayed_level_dbfs = -60.0
+            self._level_meter.set_level(-60.0)
+            self._level_status_label.setText("No input device selected")
             return
 
         try:
@@ -543,6 +623,7 @@ class MainWindow(QMainWindow):
                 fs=int(self._settings.get("sample_rate")),
                 buffer_size=int(self._settings.get("buffer_size")),
             )
+            self._level_status_label.setText("Live RMS monitor")
         except Exception as exc:
             self._statusbar.showMessage(f"Level monitor start failed: {exc}")
 
@@ -564,19 +645,16 @@ class MainWindow(QMainWindow):
 
     def _on_level_update(self, dbfs: float) -> None:
         self._last_level_dbfs = float(dbfs)
-        self._level_meter.set_level(dbfs)
 
-        input_device = self._current_input_device()
-        if input_device and self._cal_store.is_calibrated(input_device):
-            rms_fs = 10.0 ** (dbfs / 20.0) if dbfs > -120.0 else 0.0
-            spl = self._cal_store.rms_to_dbspl(input_device, rms_fs)
-            if spl is not None:
-                self._level_dbfs_label.setText(
-                    f"{dbfs:.1f} dBFS\n{spl:.1f} dB SPL"
-                )
-                return
-
-        self._level_dbfs_label.setText(f"{dbfs:.1f} dBFS")
+    def _refresh_level_meter_display(self) -> None:
+        target_db = max(-60.0, min(0.0, self._last_level_dbfs))
+        self._displayed_level_dbfs = (
+            self._displayed_level_dbfs * 0.6
+            + target_db * 0.4
+        )
+        if abs(self._displayed_level_dbfs - target_db) < 0.2:
+            self._displayed_level_dbfs = target_db
+        self._level_meter.set_level(self._displayed_level_dbfs)
 
     def _on_level_error(self, message: str) -> None:
         self._statusbar.showMessage(message)
@@ -611,8 +689,6 @@ class MainWindow(QMainWindow):
 
         self._start_queue_btn.setEnabled(idle and device_ok)
         self._cancel_queue_btn.setEnabled(busy or pass_fail)
-        self._keep_btn.setEnabled(pass_fail)
-        self._fail_btn.setEnabled(pass_fail)
 
     def _start_queue(self) -> None:
         if self._state != AppState.IDLE:
@@ -678,8 +754,8 @@ class MainWindow(QMainWindow):
         sweep = generate_log_sweep(
             duration=float(self._settings.get("sweep_duration")),
             fs=int(self._settings.get("sample_rate")),
-            f_low=float(self._settings.get("f_low")),
-            f_high=float(self._settings.get("f_high")),
+            f_low=_MEASUREMENT_F_MIN,
+            f_high=_MEASUREMENT_F_MAX,
         )
 
         worker = SweepWorker()
@@ -717,8 +793,8 @@ class MainWindow(QMainWindow):
                 recording=recording,
                 sweep=sweep,
                 fs=int(self._settings.get("sample_rate")),
-                f_low=float(self._settings.get("f_low")),
-                f_high=float(self._settings.get("f_high")),
+                f_low=_MEASUREMENT_F_MIN,
+                f_high=_MEASUREMENT_F_MAX,
             )
 
             mag_db = self._normalize_with_skip_noise(freqs, mag_db)
@@ -738,10 +814,9 @@ class MainWindow(QMainWindow):
             self._pending_curve = (freqs_ds, mag_ds)
             self._state = AppState.PASS_FAIL
             self._apply_state_ui()
-            self._update_plots(show_pending=False)
-            self._statusbar.showMessage(
-                "Sweep complete. Blocking for Keep / Fail."
-            )
+            self._update_plots(show_pending=True)
+            self._statusbar.showMessage("Sweep complete. Waiting for review.")
+            QTimer.singleShot(0, self._show_pass_fail_dialog)
         except Exception as exc:
             self._on_sweep_error(f"Processing error: {exc}")
 
@@ -793,6 +868,7 @@ class MainWindow(QMainWindow):
         self._pending_curve = None
         self._state = AppState.QUEUE_RUNNING
         self._apply_state_ui()
+        self._update_plots()
         self._statusbar.showMessage(
             f"Measurement {self._queue_index + 1} failed. Redoing same index."
         )
@@ -807,6 +883,7 @@ class MainWindow(QMainWindow):
         self._state = AppState.IDLE
         self._sweep_progress.setValue(0)
         self._update_queue_progress()
+        self._update_plots()
         self._apply_state_ui()
         self._start_level_monitor()
         self._statusbar.showMessage("Queue canceled.")
@@ -851,6 +928,25 @@ class MainWindow(QMainWindow):
 
         return normalize_at_1khz(freqs, mag_db, f_ref=f_ref)
 
+    def _show_pass_fail_dialog(self) -> None:
+        if self._state != AppState.PASS_FAIL or self._pending_curve is None:
+            return
+
+        dlg = PassFailDialog(
+            index=self._queue_index + 1,
+            total=max(self._queue_target, self._queue_index + 1),
+            parent=self,
+        )
+        dlg.exec()
+
+        choice = dlg.choice()
+        if choice == PassFailDialog.KEEP:
+            self._on_keep()
+        elif choice == PassFailDialog.FAIL:
+            self._on_fail()
+        else:
+            self._cancel_queue()
+
     def _recompute_average(self) -> None:
         if not self._kept_curves:
             self._average = None
@@ -858,17 +954,10 @@ class MainWindow(QMainWindow):
 
         freqs, mag_db = compute_rms_average(
             self._kept_curves,
-            n_points=300,
+            n_points=_DISPLAY_AVG_POINTS,
             f_ref=1000.0,
-            f_min=float(self._settings.get("f_low")),
-            f_max=float(self._settings.get("f_high")),
-        )
-
-        freqs, mag_db = downsample_to_log_points(
-            freqs,
-            mag_db,
-            n_points=300,
-            f_ref=1000.0,
+            f_min=_MEASUREMENT_F_MIN,
+            f_max=_MEASUREMENT_F_MAX,
         )
         self._average = (freqs, mag_db)
 
@@ -891,8 +980,23 @@ class MainWindow(QMainWindow):
 
         return freqs, mag_db
 
+    def _bottom_curve_for_display(self) -> Optional[tuple[np.ndarray, np.ndarray]]:
+        curve = self._bottom_curve_for_display_and_export()
+        if curve is None:
+            return None
+
+        freqs, mag_db = curve
+        smoothed_freqs, smoothed_mag = smooth_fractional_octave(
+            freqs,
+            mag_db,
+            fraction=_DISPLAY_AVG_SMOOTHING,
+        )
+        idx_1k = int(np.argmin(np.abs(smoothed_freqs - 1000.0)))
+        smoothed_mag = smoothed_mag - smoothed_mag[idx_1k]
+        return smoothed_freqs, smoothed_mag
+
     def _update_plots(self, *_args, show_pending: bool = False) -> None:
-        avg = self._bottom_curve_for_display_and_export()
+        avg = self._bottom_curve_for_display()
 
         kept = list(self._kept_curves)
         if show_pending and self._pending_curve is not None:

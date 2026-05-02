@@ -8,8 +8,6 @@ Top viewport:
 Bottom viewport:
   - RMS average of ALL kept curves in #FCBE11
 
-Aspect geometry rule:
-  25 dB vertically = visual width of 1 decade (20–200 Hz = 1 decade)
 """
 
 from typing import Optional
@@ -31,7 +29,7 @@ _GOLD = "#FCBE11"
 _FREQ_MIN = 20.0
 _FREQ_MAX = 20000.0
 _Y_PAD = 5.0  # dB padding above/below data
-_DB_PER_DECADE = 25.0  # aspect geometry rule
+_MIN_Y_RANGE = 12.0
 
 
 def _make_plot_widget(title: str) -> pg.PlotWidget:
@@ -69,7 +67,7 @@ class DualPlotWidget(QWidget):
         layout.setSpacing(4)
 
         self._top_plot = _make_plot_widget("Measurements")
-        self._bot_plot = _make_plot_widget("RMS Average")
+        self._bot_plot = _make_plot_widget("RMS Average (1/48 Oct)")
 
         layout.addWidget(self._top_plot, 1)
         layout.addWidget(self._bot_plot, 1)
@@ -105,7 +103,6 @@ class DualPlotWidget(QWidget):
         self._kept_curves = kept
         self._redraw_top(kept)
         self._redraw_bottom(average)
-        self._apply_aspect_geometry()
 
     def clear_all(self) -> None:
         self._kept_curves = []
@@ -132,7 +129,7 @@ class DualPlotWidget(QWidget):
                 pen = pg.mkPen(color=_TEAL, width=1.5)
             else:
                 pen = pg.mkPen(color=_GREY, width=1.0)
-            item = self._top_plot.plot(np.log10(freqs), mag_db, pen=pen)
+            item = self._top_plot.plot(freqs, mag_db, pen=pen)
             self._top_items.append(item)
 
         self._auto_center_y(self._top_plot, kept)
@@ -145,7 +142,7 @@ class DualPlotWidget(QWidget):
         if average is not None and len(average[0]) > 0:
             freqs, mag_db = average
             pen = pg.mkPen(color=_GOLD, width=2.0)
-            self._bot_item = self._bot_plot.plot(np.log10(freqs), mag_db, pen=pen)
+            self._bot_item = self._bot_plot.plot(freqs, mag_db, pen=pen)
             self._auto_center_y(self._bot_plot, [average])
 
     def _auto_center_y(
@@ -160,37 +157,9 @@ class DualPlotWidget(QWidget):
             return
         lo = float(np.nanmin(all_db)) - _Y_PAD
         hi = float(np.nanmax(all_db)) + _Y_PAD
-        # Enforce aspect geometry: range is at least enough to satisfy rule
+        if (hi - lo) < _MIN_Y_RANGE:
+            mid = (lo + hi) / 2.0
+            half = _MIN_Y_RANGE / 2.0
+            lo = mid - half
+            hi = mid + half
         pw.setYRange(lo, hi, padding=0)
-
-    def _apply_aspect_geometry(self) -> None:
-        """
-        Enforce: 25 dB visually = 1 decade width.
-        We adjust y-range on each plot based on the current pixel dimensions.
-        """
-        for pw in (self._top_plot, self._bot_plot):
-            self._enforce_aspect(pw)
-
-    def _enforce_aspect(self, pw: pg.PlotWidget) -> None:
-        vb = pw.getViewBox()
-        rect = vb.screenGeometry()
-        if rect is None or rect.width() == 0 or rect.height() == 0:
-            return
-
-        # x spans log10(20) to log10(20000) = 3 decades
-        n_decades = np.log10(_FREQ_MAX / _FREQ_MIN)  # = 3.0
-        pixels_per_decade = rect.width() / n_decades
-        pixels_per_db = pixels_per_decade / _DB_PER_DECADE
-        view_db_range = rect.height() / pixels_per_db
-
-        # Center on current y midpoint
-        current_range = vb.viewRange()[1]
-        mid_y = (current_range[0] + current_range[1]) / 2.0
-
-        new_lo = mid_y - view_db_range / 2.0
-        new_hi = mid_y + view_db_range / 2.0
-        pw.setYRange(new_lo, new_hi, padding=0)
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._apply_aspect_geometry()
