@@ -51,7 +51,9 @@ from dms.settings_manager import SettingsManager
 from dms.ui.calibration_dialog import CalibrationDialog
 from dms.ui.dual_plot_widget import DualPlotWidget
 from dms.ui.level_meter import LevelMeterWidget
+from dms.ui.session_dialog import SessionDialog
 from dms.ui.settings_dialog import SettingsDialog
+from dms.ui.toggle_switch import ToggleSwitch
 
 
 class AppState:
@@ -65,7 +67,7 @@ _MEASUREMENT_F_MIN = 20.0
 _MEASUREMENT_F_MAX = 20000.0
 _DISPLAY_AVG_POINTS = 1200
 _DISPLAY_AVG_SMOOTHING = 48
-_METER_UPDATE_MS = 220
+_METER_UPDATE_MS = 140
 
 
 class _SweepThread(QThread):
@@ -235,6 +237,9 @@ class MainWindow(QMainWindow):
         self._state = AppState.IDLE
         self._kept_curves: list[tuple[np.ndarray, np.ndarray]] = []
         self._average: Optional[tuple[np.ndarray, np.ndarray]] = None
+        self._variation: Optional[
+            tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        ] = None
         self._pending_curve: Optional[tuple[np.ndarray, np.ndarray]] = None
 
         self._queue_target = 0
@@ -256,9 +261,7 @@ class MainWindow(QMainWindow):
         self._level_monitor.level_updated.connect(self._on_level_update)
         self._level_monitor.error_occurred.connect(self._on_level_error)
 
-        self.setWindowTitle(
-            f"DMS fastgraph — {session.display_name()} @ {session.rig}"
-        )
+        self._refresh_window_title()
         self.setMinimumSize(1100, 700)
 
         self._build_ui()
@@ -309,8 +312,16 @@ class MainWindow(QMainWindow):
 
         session_box = QGroupBox("Session")
         sb_layout = QVBoxLayout(session_box)
-        sb_layout.addWidget(QLabel(f"<b>{self._session.display_name()}</b>"))
-        sb_layout.addWidget(QLabel(f"Rig: {self._session.rig}"))
+        self._session_name_label = QLabel("")
+        self._session_name_label.setTextFormat(Qt.TextFormat.RichText)
+        self._session_rig_label = QLabel("")
+        self._metadata_btn = QPushButton("Headphone Metadata…")
+        self._metadata_btn.setObjectName("btn_metadata")
+        self._metadata_btn.clicked.connect(self._open_metadata_dialog)
+        sb_layout.addWidget(self._session_name_label)
+        sb_layout.addWidget(self._session_rig_label)
+        sb_layout.addWidget(self._metadata_btn)
+        self._refresh_session_labels()
         layout.addWidget(session_box)
 
         dev_box = QGroupBox("Devices")
@@ -362,14 +373,18 @@ class MainWindow(QMainWindow):
         queue_layout = QVBoxLayout(queue_box)
 
         n_layout = QHBoxLayout()
-        n_layout.addWidget(QLabel("N kept measurements:"))
+        n_label = QLabel("Number of measurements:")
+        n_label.setStyleSheet("font-weight: 600; color: #9ad3f6;")
+        n_layout.addWidget(n_label)
         self._queue_n_spin = QSpinBox()
+        self._queue_n_spin.setObjectName("queue_count_spin")
         self._queue_n_spin.setRange(1, 100)
         self._queue_n_spin.setValue(int(self._settings.get("queue_count") or 5))
+        self._queue_n_spin.setFixedWidth(110)
         n_layout.addWidget(self._queue_n_spin)
         queue_layout.addLayout(n_layout)
 
-        self._queue_progress_label = QLabel("Kept: 0 / 0")
+        self._queue_progress_label = QLabel("Kept: 0")
         queue_layout.addWidget(self._queue_progress_label)
 
         self._queue_progress_bar = QProgressBar()
@@ -403,14 +418,21 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(queue_box)
 
-        hrtf_box = QGroupBox("HRTF Compensation")
-        hrtf_layout = QVBoxLayout(hrtf_box)
+        bottom_box = QGroupBox("Bottom View")
+        bottom_layout = QVBoxLayout(bottom_box)
 
-        self._hrtf_mode_combo = QComboBox()
-        self._hrtf_mode_combo.addItem("Off", "off")
-        self._hrtf_mode_combo.addItem("Apply loaded HRTF", "apply")
-        self._hrtf_mode_combo.currentIndexChanged.connect(self._update_plots)
-        hrtf_layout.addWidget(self._hrtf_mode_combo)
+        self._variation_toggle = ToggleSwitch("Variation Band")
+        self._variation_toggle.stateChanged.connect(self._on_bottom_view_changed)
+        bottom_layout.addWidget(self._variation_toggle)
+
+        self._hrtf_toggle = ToggleSwitch("HRTF Compensation")
+        self._hrtf_toggle.stateChanged.connect(self._update_plots)
+        bottom_layout.addWidget(self._hrtf_toggle)
+
+        bottom_hint = QLabel("Variation shows confidence-style spread of kept measurements.")
+        bottom_hint.setWordWrap(True)
+        bottom_hint.setStyleSheet("color: #91a2ba;")
+        bottom_layout.addWidget(bottom_hint)
 
         hrtf_btn_row = QHBoxLayout()
         self._hrtf_load_btn = QPushButton("Load HRTF…")
@@ -420,20 +442,25 @@ class MainWindow(QMainWindow):
         self._hrtf_clear_btn = QPushButton("Clear")
         self._hrtf_clear_btn.clicked.connect(self._clear_hrtf)
         hrtf_btn_row.addWidget(self._hrtf_clear_btn)
-        hrtf_layout.addLayout(hrtf_btn_row)
+        bottom_layout.addLayout(hrtf_btn_row)
 
         self._hrtf_label = QLabel("No HRTF loaded")
         self._hrtf_label.setWordWrap(True)
-        hrtf_layout.addWidget(self._hrtf_label)
+        bottom_layout.addWidget(self._hrtf_label)
 
         self._hrtf_invert_cb = QCheckBox("Invert sign (add instead of subtract)")
         self._hrtf_invert_cb.stateChanged.connect(self._on_hrtf_invert_changed)
-        hrtf_layout.addWidget(self._hrtf_invert_cb)
+        bottom_layout.addWidget(self._hrtf_invert_cb)
 
-        layout.addWidget(hrtf_box, 1)
+        layout.addWidget(bottom_box, 1)
 
         misc_box = QGroupBox("Tools")
         misc_layout = QVBoxLayout(misc_box)
+
+        undo_btn = QPushButton("↶ Undo Last Measurement")
+        undo_btn.clicked.connect(self._undo_last_measurement)
+        misc_layout.addWidget(undo_btn)
+        self._undo_btn = undo_btn
 
         clear_btn = QPushButton("Clear All Measurements")
         clear_btn.clicked.connect(self._clear_all)
@@ -496,7 +523,7 @@ class MainWindow(QMainWindow):
     def _is_hrtf_active(self) -> bool:
         return (
             self._hrtf is not None
-            and self._hrtf_mode_combo.currentData() == "apply"
+            and self._hrtf_toggle.isChecked()
         )
 
     def _restore_hrtf_state(self) -> None:
@@ -516,16 +543,14 @@ class MainWindow(QMainWindow):
 
     def _sync_hrtf_ui(self) -> None:
         has_hrtf = self._hrtf is not None
-        self._hrtf_mode_combo.setEnabled(has_hrtf)
+        self._hrtf_toggle.setEnabled(has_hrtf)
         self._hrtf_clear_btn.setEnabled(has_hrtf)
 
         if has_hrtf:
             self._hrtf_label.setText(self._hrtf.path)
-            if self._hrtf_mode_combo.currentData() not in {"off", "apply"}:
-                self._hrtf_mode_combo.setCurrentIndex(1)
         else:
             self._hrtf_label.setText("No HRTF loaded")
-            self._hrtf_mode_combo.setCurrentIndex(0)
+            self._hrtf_toggle.setChecked(False)
 
     def _refresh_devices(self) -> None:
         selected_out = self._current_output_device() or self._settings.get(
@@ -700,8 +725,8 @@ class MainWindow(QMainWindow):
     def _refresh_level_meter_display(self) -> None:
         target_db = max(-60.0, min(0.0, self._last_level_dbfs))
         self._displayed_level_dbfs = (
-            self._displayed_level_dbfs * 0.6
-            + target_db * 0.4
+            self._displayed_level_dbfs * 0.5
+            + target_db * 0.5
         )
         if abs(self._displayed_level_dbfs - target_db) < 0.2:
             self._displayed_level_dbfs = target_db
@@ -726,20 +751,24 @@ class MainWindow(QMainWindow):
             self._in_dev_combo,
             self._ch_combo,
             self._queue_n_spin,
-            self._hrtf_mode_combo,
+            self._variation_toggle,
+            self._hrtf_toggle,
             self._hrtf_load_btn,
             self._hrtf_clear_btn,
             self._hrtf_invert_cb,
             self._settings_btn,
             self._cal_btn,
             self._test_level_btn,
-            self._export_btn,
+            self._undo_btn,
             self._clear_btn,
+            self._metadata_btn,
         ):
             widget.setEnabled(idle)
 
         self._start_queue_btn.setEnabled(idle and device_ok)
         self._cancel_queue_btn.setEnabled(busy or pass_fail)
+        self._undo_btn.setEnabled(idle and len(self._kept_curves) > 0)
+        self._sync_export_button()
 
     def _start_queue(self) -> None:
         if self._state != AppState.IDLE:
@@ -768,8 +797,9 @@ class MainWindow(QMainWindow):
 
         self._queue_progress_bar.setRange(0, max(1, self._queue_target))
         self._queue_progress_bar.setValue(0)
+        kept_count = len(self._kept_curves)
         self._queue_progress_label.setText(
-            f"Kept: {self._queue_index} / {self._queue_target}"
+            f"Kept: {kept_count}"
         )
 
         self._state = AppState.QUEUE_RUNNING
@@ -898,6 +928,7 @@ class MainWindow(QMainWindow):
         self._current_sweep_attempts = 0
 
         self._recompute_average()
+        self._recompute_variation()
         self._update_queue_progress()
         self._update_plots()
 
@@ -951,8 +982,9 @@ class MainWindow(QMainWindow):
         target = max(0, self._queue_target)
         self._queue_progress_bar.setRange(0, max(1, target))
         self._queue_progress_bar.setValue(min(self._queue_index, max(1, target)))
+        kept_count = len(self._kept_curves)
         self._queue_progress_label.setText(
-            f"Kept: {self._queue_index} / {target}"
+            f"Kept: {kept_count}"
         )
 
     def _show_pass_fail_dialog(self) -> None:
@@ -1017,6 +1049,45 @@ class MainWindow(QMainWindow):
         )
         self._average = (freqs, mag_db)
 
+    def _recompute_variation(self) -> None:
+        if not self._kept_curves:
+            self._variation = None
+            return
+
+        base = self._bottom_curve_for_display()
+        if base is None:
+            self._variation = None
+            return
+
+        base_freqs, _ = base
+        rows: list[np.ndarray] = []
+        for freqs, mag in self._kept_curves:
+            values = np.interp(base_freqs, freqs, mag)
+            if self._is_hrtf_active():
+                values = self._hrtf.apply(
+                    base_freqs,
+                    values,
+                    invert=self._hrtf_invert_cb.isChecked(),
+                )
+            _, values = smooth_fractional_octave(
+                base_freqs,
+                values,
+                fraction=_DISPLAY_AVG_SMOOTHING,
+            )
+            rows.append(values)
+
+        if not rows:
+            self._variation = None
+            return
+
+        mat = np.vstack(rows)
+        p10 = np.percentile(mat, 10, axis=0)
+        p25 = np.percentile(mat, 25, axis=0)
+        p75 = np.percentile(mat, 75, axis=0)
+        p90 = np.percentile(mat, 90, axis=0)
+        median = np.percentile(mat, 50, axis=0)
+        self._variation = (base_freqs, p10, p25, p75, p90, median)
+
     def _bottom_curve_for_display_and_export(
         self,
     ) -> Optional[tuple[np.ndarray, np.ndarray]]:
@@ -1048,12 +1119,26 @@ class MainWindow(QMainWindow):
 
     def _update_plots(self, *_args, show_pending: bool = False) -> None:
         avg = self._bottom_curve_for_display()
+        self._recompute_variation()
 
         kept = list(self._kept_curves)
         if show_pending and self._pending_curve is not None:
             kept = kept + [self._pending_curve]
 
-        self._plots.update_curves(kept=kept, average=avg)
+        self._plots.update_curves(
+            kept=kept,
+            average=avg,
+            variation=self._variation,
+            bottom_mode=self._bottom_view_mode(),
+            animate_last=show_pending and self._pending_curve is not None,
+        )
+        self._sync_export_button()
+
+    def _bottom_view_mode(self) -> str:
+        return "variation" if self._variation_toggle.isChecked() else "average"
+
+    def _on_bottom_view_changed(self, *_args) -> None:
+        self._update_plots()
 
     def _load_hrtf(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -1069,8 +1154,7 @@ class MainWindow(QMainWindow):
             self._hrtf = HRTFCurve(path)
             self._settings.set("hrtf_path", path)
             self._sync_hrtf_ui()
-            if self._hrtf_mode_combo.currentData() == "off":
-                self._hrtf_mode_combo.setCurrentIndex(1)
+            self._hrtf_toggle.setChecked(True)
             self._update_plots()
             self._statusbar.showMessage(f"Loaded HRTF: {Path(path).name}")
         except Exception as exc:
@@ -1098,6 +1182,7 @@ class MainWindow(QMainWindow):
 
         self._kept_curves.clear()
         self._average = None
+        self._variation = None
         self._pending_curve = None
         self._queue_target = 0
         self._queue_index = 0
@@ -1107,10 +1192,41 @@ class MainWindow(QMainWindow):
         self._sweep_progress.setValue(0)
         self._statusbar.showMessage("All measurements cleared.")
 
+    def _undo_last_measurement(self) -> None:
+        if self._state != AppState.IDLE:
+            QMessageBox.information(
+                self,
+                "Busy",
+                "Undo is only available while idle.",
+            )
+            return
+
+        if not self._kept_curves:
+            return
+
+        self._kept_curves.pop()
+        self._recompute_average()
+        self._recompute_variation()
+        self._update_queue_progress()
+        self._update_plots()
+        self._statusbar.showMessage("Last kept measurement removed.")
+
     def _open_settings(self) -> None:
         dlg = SettingsDialog(self._settings, self)
         if dlg.exec():
             self._start_level_monitor()
+
+    def _open_metadata_dialog(self) -> None:
+        dlg = SessionDialog(
+            self._settings,
+            self,
+            initial_session=self._session,
+        )
+        if dlg.exec():
+            self._session = dlg.session_data()
+            self._refresh_session_labels()
+            self._refresh_window_title()
+            self._statusbar.showMessage("Headphone metadata updated.")
 
     def _open_calibration(self) -> None:
         input_device = self._current_input_device()
@@ -1206,6 +1322,13 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Export Error", str(exc))
 
+    def _sync_export_button(self) -> None:
+        self._export_btn.setText("Export Average…")
+        self._export_btn.setToolTip(
+            "Export averaged FR as a REW-style TXT file (available in all bottom-view modes)."
+        )
+        self._export_btn.setEnabled(self._state == AppState.IDLE and self._average is not None)
+
     def closeEvent(self, event) -> None:
         self._close_pass_fail_dialog()
         try:
@@ -1224,3 +1347,12 @@ class MainWindow(QMainWindow):
             pass
 
         super().closeEvent(event)
+
+    def _refresh_session_labels(self) -> None:
+        self._session_name_label.setText(f"<b>{self._session.display_name()}</b>")
+        self._session_rig_label.setText(f"Rig: {self._session.rig}")
+
+    def _refresh_window_title(self) -> None:
+        self.setWindowTitle(
+            f"DMS fastgraph — {self._session.display_name()} @ {self._session.rig}"
+        )

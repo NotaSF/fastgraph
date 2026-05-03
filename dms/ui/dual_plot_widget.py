@@ -13,7 +13,7 @@ Bottom viewport:
 from typing import Optional
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import QRect
+from PyQt6.QtCore import QRect, QTimer
 from PyQt6.QtWidgets import QWidget, QVBoxLayout
 from PyQt6.QtCore import Qt
 
@@ -23,18 +23,27 @@ pg.setConfigOption("foreground", "#888888")
 pg.setConfigOption("antialias", True)
 
 
-_GREY = (100, 100, 100, 120)
+_GREY = (130, 130, 130, 150)
 _TEAL = (80, 180, 170, 220)
 _GOLD = "#FCBE11"
+_BAND_OUTER = (110, 160, 220, 55)
+_BAND_INNER = (130, 185, 255, 90)
+_BAND_MEDIAN = (170, 215, 255, 220)
 
 _FREQ_MIN = 20.0
 _FREQ_MAX = 20000.0
-_Y_PAD = 5.0  # dB padding above/below data
-_MIN_Y_RANGE = 12.0
+_Y_WINDOW_DB = 30.0
+_Y_DEFAULT_TOP_DB = 15.0
+_Y_TOP_HEADROOM_DB = 1.0
+
+
+class _NoWheelPlotWidget(pg.PlotWidget):
+    def wheelEvent(self, event) -> None:
+        event.ignore()
 
 
 def _make_plot_widget(title: str) -> pg.PlotWidget:
-    pw = pg.PlotWidget(title=title)
+    pw = _NoWheelPlotWidget(title=title)
     ax = pw.getAxis("bottom")
     ax.setLabel("Frequency", units="Hz")
     pw.getAxis("left").setLabel("Magnitude", units="dB")
@@ -55,6 +64,8 @@ def _make_plot_widget(title: str) -> pg.PlotWidget:
         (np.log10(20000), "20k"),
     ]
     ax.setTicks([ticks])
+    # Lock to 25 dB per decade (1 decade on x equals 25 dB on y).
+    pw.getPlotItem().getViewBox().setAspectLocked(lock=True, ratio=25.0)
     return pw
 
 
@@ -67,14 +78,21 @@ class DualPlotWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        self._top_plot = _make_plot_widget("Measurements")
-        self._bot_plot = _make_plot_widget("RMS Average (1/48 Oct)")
+        self._top_plot = _make_plot_widget("All Measurements (Top)")
+        self._bot_plot = _make_plot_widget("Averaged Result (1/48 Oct RMS)")
 
         layout.addWidget(self._top_plot, 1)
         layout.addWidget(self._bot_plot, 1)
 
         self._top_items: list[pg.PlotDataItem] = []
         self._bot_item: Optional[pg.PlotDataItem] = None
+        self._bot_extra_items: list[object] = []
+        self._reveal_item: Optional[pg.PlotDataItem] = None
+        self._reveal_curve: Optional[tuple[np.ndarray, np.ndarray]] = None
+        self._reveal_progress = 0.0
+        self._reveal_timer = QTimer(self)
+        self._reveal_timer.setInterval(10)
+        self._reveal_timer.timeout.connect(self._tick_reveal_animation)
 
         # 1 kHz reference line (both plots)
         for pw in (self._top_plot, self._bot_plot):
@@ -99,13 +117,24 @@ class DualPlotWidget(QWidget):
         self,
         kept: list[tuple[np.ndarray, np.ndarray]],
         average: Optional[tuple[np.ndarray, np.ndarray]],
+        variation: Optional[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = None,
+        bottom_mode: str = "average",
+        animate_last: bool = False,
     ) -> None:
         """Redraw both viewports. Call from main thread only."""
+        self._reveal_timer.stop()
+        self._reveal_item = None
+        self._reveal_curve = None
         self._kept_curves = kept
         self._redraw_top(kept)
-        self._redraw_bottom(average)
+        self._redraw_bottom(average=average, variation=variation, mode=bottom_mode)
+        if animate_last and kept and self._top_items:
+            self._start_last_curve_reveal(kept[-1], self._top_items[-1])
 
     def clear_all(self) -> None:
+        self._reveal_timer.stop()
+        self._reveal_item = None
+        self._reveal_curve = None
         self._kept_curves = []
         for item in self._top_items:
             self._top_plot.removeItem(item)
@@ -113,10 +142,20 @@ class DualPlotWidget(QWidget):
         if self._bot_item:
             self._bot_plot.removeItem(self._bot_item)
             self._bot_item = None
+        for item in self._bot_extra_items:
+            self._bot_plot.removeItem(item)
+        self._bot_extra_items.clear()
 
     def bottom_plot_global_rect(self) -> QRect:
         top_left = self._bot_plot.mapToGlobal(self._bot_plot.rect().topLeft())
         return QRect(top_left, self._bot_plot.size())
+
+    def export_bottom_plot_image(self, output_path: str) -> bool:
+        pixmap = self._bot_plot.grab()
+        return pixmap.save(output_path, "PNG")
+
+    def bottom_plot_pixmap(self):
+        return self._bot_plot.grab()
 
     # ------------------------------------------------------------------
     # Internal drawing
@@ -139,16 +178,64 @@ class DualPlotWidget(QWidget):
 
         self._auto_center_y(self._top_plot, kept)
 
-    def _redraw_bottom(self, average: Optional[tuple[np.ndarray, np.ndarray]]) -> None:
+    def _clear_bottom_items(self) -> None:
         if self._bot_item:
             self._bot_plot.removeItem(self._bot_item)
             self._bot_item = None
+        for item in self._bot_extra_items:
+            self._bot_plot.removeItem(item)
+        self._bot_extra_items.clear()
 
+    def _redraw_bottom(
+        self,
+        average: Optional[tuple[np.ndarray, np.ndarray]],
+        variation: Optional[
+            tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        ],
+        mode: str,
+    ) -> None:
+        self._clear_bottom_items()
+        if mode == "variation":
+            self._bot_plot.setTitle("Variation Band (Confidence Style)")
+            self._draw_variation_bottom(variation)
+            return
+
+        self._bot_plot.setTitle("Averaged Result (1/48 Oct RMS)")
         if average is not None and len(average[0]) > 0:
             freqs, mag_db = average
             pen = pg.mkPen(color=_GOLD, width=2.0)
             self._bot_item = self._bot_plot.plot(freqs, mag_db, pen=pen)
             self._auto_center_y(self._bot_plot, [average])
+
+    def _draw_variation_bottom(
+        self,
+        variation: Optional[
+            tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        ],
+    ) -> None:
+        if variation is None:
+            return
+        freqs, p10, p25, p75, p90, median = variation
+        if len(freqs) == 0:
+            return
+
+        upper90 = self._bot_plot.plot(freqs, p90, pen=pg.mkPen(color=(0, 0, 0, 0)))
+        lower10 = self._bot_plot.plot(freqs, p10, pen=pg.mkPen(color=(0, 0, 0, 0)))
+        fill90 = pg.FillBetweenItem(upper90, lower10, brush=pg.mkBrush(_BAND_OUTER))
+        self._bot_plot.addItem(fill90)
+
+        upper75 = self._bot_plot.plot(freqs, p75, pen=pg.mkPen(color=(0, 0, 0, 0)))
+        lower25 = self._bot_plot.plot(freqs, p25, pen=pg.mkPen(color=(0, 0, 0, 0)))
+        fill75 = pg.FillBetweenItem(upper75, lower25, brush=pg.mkBrush(_BAND_INNER))
+        self._bot_plot.addItem(fill75)
+
+        median_item = self._bot_plot.plot(
+            freqs,
+            median,
+            pen=pg.mkPen(color=_BAND_MEDIAN, width=1.8),
+        )
+        self._bot_extra_items.extend([upper90, lower10, fill90, upper75, lower25, fill75, median_item])
+        self._auto_center_y(self._bot_plot, [(freqs, p10), (freqs, p90)])
 
     def _auto_center_y(
         self,
@@ -156,15 +243,46 @@ class DualPlotWidget(QWidget):
         curves: list[tuple[np.ndarray, np.ndarray]],
     ) -> None:
         if not curves:
+            pw.setYRange(_Y_DEFAULT_TOP_DB - _Y_WINDOW_DB, _Y_DEFAULT_TOP_DB, padding=0)
             return
         all_db = np.concatenate([m for _, m in curves])
         if len(all_db) == 0:
+            pw.setYRange(_Y_DEFAULT_TOP_DB - _Y_WINDOW_DB, _Y_DEFAULT_TOP_DB, padding=0)
             return
-        lo = float(np.nanmin(all_db)) - _Y_PAD
-        hi = float(np.nanmax(all_db)) + _Y_PAD
-        if (hi - lo) < _MIN_Y_RANGE:
-            mid = (lo + hi) / 2.0
-            half = _MIN_Y_RANGE / 2.0
-            lo = mid - half
-            hi = mid + half
+
+        # Default framing is -15..+15 dB around 0 dB.
+        # If peaks exceed the top, shift the fixed 30 dB window upward.
+        data_top = float(np.nanmax(all_db)) + _Y_TOP_HEADROOM_DB
+        hi = max(_Y_DEFAULT_TOP_DB, data_top)
+        lo = hi - _Y_WINDOW_DB
         pw.setYRange(lo, hi, padding=0)
+
+    def _start_last_curve_reveal(
+        self,
+        curve: tuple[np.ndarray, np.ndarray],
+        item: pg.PlotDataItem,
+    ) -> None:
+        self._reveal_curve = curve
+        self._reveal_item = item
+        self._reveal_progress = 0.08
+        self._tick_reveal_animation()
+        self._reveal_timer.start()
+
+    def _tick_reveal_animation(self) -> None:
+        if self._reveal_curve is None or self._reveal_item is None:
+            self._reveal_timer.stop()
+            return
+
+        freqs, mag_db = self._reveal_curve
+        n = len(freqs)
+        if n <= 1:
+            self._reveal_timer.stop()
+            return
+
+        k = max(2, min(n, int(n * self._reveal_progress)))
+        self._reveal_item.setData(freqs[:k], mag_db[:k])
+
+        self._reveal_progress += 0.14
+        if self._reveal_progress >= 1.02:
+            self._reveal_item.setData(freqs, mag_db)
+            self._reveal_timer.stop()

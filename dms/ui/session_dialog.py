@@ -9,11 +9,17 @@ from dms.settings_manager import SettingsManager
 
 
 class SessionDialog(QDialog):
-    def __init__(self, settings: SettingsManager, parent=None) -> None:
+    def __init__(
+        self,
+        settings: SettingsManager,
+        parent=None,
+        initial_session: SessionData | None = None,
+    ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("DMS Fastgraph — New Session")
+        self.setWindowTitle("Headphone Metadata")
         self.setMinimumWidth(480)
         self._settings = settings
+        self._initial_session = initial_session
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -74,6 +80,7 @@ class SessionDialog(QDialog):
         form.addRow("Acoustic Type", self._open_back)
         form.addRow("Pads / Tips Notes", self._pads)
         form.addRow("Connection", self._connection)
+        self._load_initial_values()
 
         scroll.setWidget(inner)
         outer.addWidget(scroll, 1)
@@ -102,6 +109,25 @@ class SessionDialog(QDialog):
             self._status.setText(f"Required: {', '.join(missing)}")
             return
         self.accept()
+
+    def _load_initial_values(self) -> None:
+        if self._initial_session is None:
+            return
+
+        s = self._initial_session
+        self._rig.setText(s.rig)
+        self._brand.setText(s.brand)
+        self._model.setText(s.model)
+        self._model_number.setText(s.model_number)
+        self._asset_tag.setText(s.asset_tag)
+        self._firmware.setText(s.firmware)
+        self._eq.setChecked(s.eq_applied)
+        self._anc.setChecked(s.anc_mode)
+        self._anc_name.setText(s.anc_mode_name)
+        self._form_factor.setCurrentText(s.form_factor)
+        self._open_back.setCurrentText("open back" if s.open_back else "closed back")
+        self._pads.setText(s.pads_notes)
+        self._connection.setCurrentText(s.connection)
 
     def session_data(self) -> SessionData:
         return SessionData(
