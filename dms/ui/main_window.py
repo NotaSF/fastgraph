@@ -11,7 +11,6 @@ import numpy as np
 from PyQt6.QtCore import QThread, QTimer, Qt, QUrl
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -307,6 +306,10 @@ class MainWindow(QMainWindow):
         self._statusbar = QStatusBar()
         self.setStatusBar(self._statusbar)
         self._statusbar.showMessage("Ready.")
+        self._version_label = QLabel(f"v{__version__}")
+        self._version_label.setStyleSheet("color: #8b95a6; font-size: 11px;")
+        self._version_label.setToolTip("DMS Fastgraph version")
+        self._statusbar.addPermanentWidget(self._version_label)
         self._build_update_indicator()
 
     def _build_control_panel(self) -> QWidget:
@@ -453,10 +456,6 @@ class MainWindow(QMainWindow):
         self._hrtf_label.setWordWrap(True)
         bottom_layout.addWidget(self._hrtf_label)
 
-        self._hrtf_invert_cb = QCheckBox("Invert sign (add instead of subtract)")
-        self._hrtf_invert_cb.stateChanged.connect(self._on_hrtf_invert_changed)
-        bottom_layout.addWidget(self._hrtf_invert_cb)
-
         layout.addWidget(bottom_box, 1)
 
         misc_box = QGroupBox("Tools")
@@ -555,9 +554,6 @@ class MainWindow(QMainWindow):
 
     def _restore_hrtf_state(self) -> None:
         path = self._settings.get("hrtf_path")
-        invert = bool(self._settings.get("hrtf_invert"))
-
-        self._hrtf_invert_cb.setChecked(invert)
 
         if path:
             try:
@@ -831,7 +827,6 @@ class MainWindow(QMainWindow):
             self._hrtf_toggle,
             self._hrtf_load_btn,
             self._hrtf_clear_btn,
-            self._hrtf_invert_cb,
             self._settings_btn,
             self._cal_btn,
             self._test_level_btn,
@@ -1143,7 +1138,6 @@ class MainWindow(QMainWindow):
                 values = self._hrtf.apply(
                     base_freqs,
                     values,
-                    invert=self._hrtf_invert_cb.isChecked(),
                 )
             _, values = smooth_fractional_octave(
                 base_freqs,
@@ -1175,7 +1169,6 @@ class MainWindow(QMainWindow):
             corrected = self._hrtf.apply(
                 freqs,
                 mag_db,
-                invert=self._hrtf_invert_cb.isChecked(),
             )
             return freqs, corrected
 
@@ -1242,10 +1235,6 @@ class MainWindow(QMainWindow):
         self._sync_hrtf_ui()
         self._update_plots()
         self._statusbar.showMessage("HRTF cleared.")
-
-    def _on_hrtf_invert_changed(self) -> None:
-        self._settings.set("hrtf_invert", self._hrtf_invert_cb.isChecked())
-        self._update_plots()
 
     def _clear_all(self) -> None:
         if self._state != AppState.IDLE:
@@ -1392,7 +1381,6 @@ class MainWindow(QMainWindow):
                 output_path=Path(path_str),
                 compensated=compensated,
                 hrtf=self._hrtf if compensated else None,
-                hrtf_invert=self._hrtf_invert_cb.isChecked(),
             )
             self._statusbar.showMessage(f"Exported: {path_str}")
         except Exception as exc:

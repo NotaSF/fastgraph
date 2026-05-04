@@ -15,7 +15,6 @@ _DEFAULTS: dict[str, Any] = {
     "input_channel": 0,
     "queue_count": 5,
     "hrtf_path": None,
-    "hrtf_invert": False,
     "pre_sweep_silence": 0.2,
     "post_sweep_silence": 0.5,
     "latency": "low",

@@ -33,7 +33,6 @@ def export_curve(
     output_path: Path,
     compensated: bool,
     hrtf: Optional[HRTFCurve] = None,
-    hrtf_invert: bool = False,
 ) -> None:
     """Write REW-compatible TXT file."""
     header = session.to_rew_header()
@@ -46,7 +45,6 @@ def export_curve(
     ]
     if compensated and hrtf:
         lines.append(f"* HRTF File: {hrtf.name}")
-        lines.append(f"* HRTF Sign: {'Inverted (+)' if hrtf_invert else 'Normal (-)'}")
 
     lines += [
         "* Normalization: 1 kHz reference offset only (shape preserved)",
