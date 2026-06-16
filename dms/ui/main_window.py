@@ -81,7 +81,12 @@ from dms.processing import (
     normalize_at_1khz,
     smooth_fractional_octave,
 )
-from dms.secure_store import decrypt_credentials, encrypt_credentials
+from dms.secure_store import (
+    SecureStoreError,
+    decrypt_credentials,
+    encrypt_credentials,
+    should_migrate_credentials,
+)
 from dms.session import SessionData
 from dms.settings_manager import SettingsManager
 from dms.squiglink import (
@@ -2614,7 +2619,18 @@ class MainWindow(QMainWindow):
             )
             return
 
-        saved = decrypt_credentials(self._settings.get("squiglink_credentials_encrypted"))
+        saved_blob = self._settings.get("squiglink_credentials_encrypted")
+        saved = decrypt_credentials(saved_blob)
+
+        if saved and should_migrate_credentials(saved_blob):
+            try:
+                self._settings.set(
+                    "squiglink_credentials_encrypted",
+                    encrypt_credentials(saved[0], saved[1]),
+                )
+            except SecureStoreError:
+                pass
+
         remember_saved = bool(self._settings.get("squiglink_remember_credentials"))
         auth = SquiglinkAuthDialog(
             self,
@@ -2622,21 +2638,34 @@ class MainWindow(QMainWindow):
             initial_password=saved[1] if saved else "",
             remember=remember_saved,
         )
+
         if auth.exec() != QDialog.DialogCode.Accepted:
             return
 
         username = auth.username()
         password = auth.password()
+
         remember = auth.remember_credentials()
         self._settings.set("squiglink_remember_credentials", remember)
+
         if remember:
-            self._settings.set(
-                "squiglink_credentials_encrypted",
-                encrypt_credentials(username, password),
-            )
+            try:
+                self._settings.set(
+                    "squiglink_credentials_encrypted",
+                    encrypt_credentials(username, password),
+                )
+            except SecureStoreError:
+                self._settings.set("squiglink_remember_credentials", False)
+                self._settings.set("squiglink_credentials_encrypted", None)
+
+                QMessageBox.warning(
+                    self,
+                    "Could Not Remember Credentials",
+                    "Fastgraph could not access this system's secure credential store.\n\n"
+                    "Your upload can continue, but your credentials will not be remembered.",
+                )
         else:
             self._settings.set("squiglink_credentials_encrypted", None)
-
         compensated = self._is_hrtf_active()
         if not self._ensure_upload_metadata():
             return
